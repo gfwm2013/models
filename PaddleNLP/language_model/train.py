@@ -238,10 +238,20 @@ def main():
         x, y = batch
         x = x.reshape((-1, config.num_steps, 1))
         y = y.reshape((-1, 1))
-
         res = {}
-        res['x'] = x
         res['y'] = y
+
+        if config.rnn_model != 'dynamic':
+            x = x.reshape((-1, config.num_steps, 1))
+            res['x'] = x
+        else:
+            x = x.reshape((-1, 1))
+            x_tensor = fluid.LoDTensor()
+            x_tensor.set(x, place)
+            lod = [[config.num_steps for _ in range(config.batch_size)]]
+            x_tensor.set_recursive_sequence_lengths(lod)
+            res['x'] = x_tensor
+
         if init_hidden is not None:
             res['init_hidden'] = init_hidden
         if init_cell is not None:

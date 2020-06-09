@@ -19,6 +19,7 @@ import collections
 import os
 import sys
 import numpy as np
+from paddle.fluid import profiler
 
 EOS = "</eos>"
 
@@ -78,6 +79,10 @@ def get_data_iter(raw_data, batch_size, num_steps):
 
     epoch_size = (batch_len - 1) // num_steps
     for i in range(epoch_size):
+        if i == 5:
+            profiler.start_profiler("All", "OpDetail")
+        if i == 10:
+            profiler.stop_profiler("total", "/tmp/profile")
         start = i * num_steps
         x = np.copy(data[:, i * num_steps:(i + 1) * num_steps])
         y = np.copy(data[:, i * num_steps + 1:(i + 1) * num_steps + 1])

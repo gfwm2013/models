@@ -70,7 +70,8 @@ class RNNConfig(object):
         else:
             raise ValueError('Unsupported model_type.')
 
-        if args.rnn_model not in ('static', 'padding', 'cudnn', 'basic_lstm'):
+        if args.rnn_model not in ('static', 'padding', 'dynamic', 'cudnn',
+                                  'basic_lstm'):
             raise ValueError('Unsupported rnn_model.')
 
         if args.batch_size > 0:

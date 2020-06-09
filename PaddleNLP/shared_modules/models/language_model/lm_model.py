@@ -19,6 +19,7 @@ from __future__ import print_function
 import paddle.fluid.layers as layers
 import paddle.fluid as fluid
 from paddle.fluid.layers.control_flow import StaticRNN as PaddingRNN
+from paddle.fluid.layers.control_flow import DynamicRNN
 import numpy as np
 from paddle.fluid import ParamAttr
 from paddle.fluid.contrib.layers import basic_lstm
@@ -137,6 +138,104 @@ def lm_model(hidden_size,
 
         return real_res, last_hidden, last_cell
 
+    def dynamic_rnn(input_embedding, len=3, init_hidden=None, init_cell=None):
+        weight_1_arr = []
+        bias_arr = []
+        hidden_array = []
+        cell_array = []
+
+        for i in range(num_layers):
+            weight_1 = layers.create_parameter(
+                [hidden_size * 2, hidden_size * 4],
+                dtype='float32',
+                name='fc_weight1_' + str(i),
+                default_initializer=fluid.initializer.UniformInitializer(
+                    low=-init_scale, high=init_scale))
+            weight_1_arr.append(weight_1)
+            bias_1 = layers.create_parameter(
+                [hidden_size * 4],
+                dtype='float32',
+                name='fc_bias1_' + str(i),
+                default_initializer=fluid.initializer.Constant(0.0))
+            bias_arr.append(bias_1)
+            pre_hidden = layers.slice(
+                init_hidden, axes=[0], starts=[i], ends=[i + 1])
+            pre_cell = layers.slice(
+                init_cell, axes=[0], starts=[i], ends=[i + 1])
+            pre_hidden = layers.reshape(pre_hidden, shape=[-1, hidden_size])
+            pre_cell = layers.reshape(pre_cell, shape=[-1, hidden_size])
+            hidden_array.append(pre_hidden)
+            cell_array.append(pre_cell)
+
+        rnn = DynamicRNN()
+        with rnn.block():
+            input = rnn.step_input(input_embedding)
+            for k in range(num_layers):
+                pre_hidden = rnn.memory(init=hidden_array[k])
+                pre_cell = rnn.memory(init=cell_array[k])
+                weight_1 = weight_1_arr[k]
+                bias = bias_arr[k]
+
+                nn = layers.concat([input, pre_hidden], 1)
+                gate_input = layers.matmul(x=nn, y=weight_1)
+
+                gate_input = layers.elementwise_add(x=gate_input, y=bias)
+                i = layers.slice(
+                    gate_input, axes=[1], starts=[0], ends=[hidden_size])
+                j = layers.slice(
+                    gate_input,
+                    axes=[1],
+                    starts=[hidden_size],
+                    ends=[hidden_size * 2])
+                f = layers.slice(
+                    gate_input,
+                    axes=[1],
+                    starts=[hidden_size * 2],
+                    ends=[hidden_size * 3])
+                o = layers.slice(
+                    gate_input,
+                    axes=[1],
+                    starts=[hidden_size * 3],
+                    ends=[hidden_size * 4])
+
+                c = pre_cell * layers.sigmoid(f) + layers.sigmoid(
+                    i) * layers.tanh(j)
+                m = layers.tanh(c) * layers.sigmoid(o)
+
+                rnn.update_memory(pre_hidden, m)
+                rnn.update_memory(pre_cell, c)
+
+                rnn.output(m)
+                rnn.output(c)
+
+                input = m
+
+                if dropout != None and dropout > 0.0:
+                    input = layers.dropout(
+                        input,
+                        dropout_prob=dropout,
+                        dropout_implementation='upscale_in_train')
+            rnn.output(input)
+
+        rnnout = rnn()
+
+        last_hidden_array = []
+        last_cell_array = []
+        real_res = rnnout[-1]
+        for i in range(num_layers):
+            m = layers.sequence_last_step(rnnout[i * 2])
+            m = layers.reshape(m, shape=[1] + list(m.shape))
+            c = layers.sequence_last_step(rnnout[i * 2 + 1])
+            c = layers.reshape(c, shape=[1] + list(c.shape))
+            m.stop_gradient = True
+            c.stop_gradient = True
+            last_hidden_array.append(m)
+            last_cell_array.append(c)
+        last_hidden = layers.concat(last_hidden_array, 0)
+        last_cell = layers.concat(last_cell_array, 0)
+
+        return real_res, last_hidden, last_cell
+
     def encoder_static(input_embedding, len=3, init_hidden=None,
                        init_cell=None):
 
@@ -223,8 +322,13 @@ def lm_model(hidden_size,
 
         return real_res, last_hidden, last_cell
 
-    x = fluid.data(name="x", shape=[None, num_steps, 1], dtype='int64')
+    if rnn_model != 'dynamic':
+        x = fluid.data(name="x", shape=[None, num_steps, 1], dtype='int64')
+    else:
+        x = fluid.data(name="x", shape=[None, 1], dtype='int64', lod_level=1)
     y = fluid.data(name="y", shape=[None, 1], dtype='int64')
+    x.stop_gradient = False
+    y.stop_graident = False
 
     if use_dataloader:
         dataloader = fluid.io.DataLoader.from_generator(
@@ -260,8 +364,12 @@ def lm_model(hidden_size,
             initializer=fluid.initializer.UniformInitializer(
                 low=-init_scale, high=init_scale)))
 
-    x_emb = layers.reshape(
-        x_emb, shape=[-1, num_steps, hidden_size], inplace=True)
+    if rnn_model != 'dynamic':
+        x_emb = layers.reshape(
+            x_emb, shape=[-1, num_steps, hidden_size], inplace=True)
+    else:
+        x_emb = layers.reshape(x_emb, shape=[-1, hidden_size], inplace=True)
+
     if dropout != None and dropout > 0.0:
         x_emb = layers.dropout(
             x_emb,
@@ -274,6 +382,9 @@ def lm_model(hidden_size,
             len=num_steps,
             init_hidden=init_hidden_reshape,
             init_cell=init_cell_reshape)
+    elif rnn_model == "dynamic":
+        rnn_out, last_hidden, last_cell = dynamic_rnn(
+            x_emb, init_hidden=init_hidden_reshape, init_cell=init_cell_reshape)
     elif rnn_model == "static":
         rnn_out, last_hidden, last_cell = encoder_static(
             x_emb,
@@ -302,9 +413,9 @@ def lm_model(hidden_size,
     else:
         print("type not support")
         return
-
-    rnn_out = layers.reshape(
-        rnn_out, shape=[-1, num_steps, hidden_size], inplace=True)
+    if rnn_model != 'dyanmic':
+        rnn_out = layers.reshape(
+            rnn_out, shape=[-1, num_steps, hidden_size])  #, inplace=True)
 
     softmax_weight = layers.create_parameter(
         [hidden_size, vocab_size],
@@ -322,7 +433,7 @@ def lm_model(hidden_size,
     projection = layers.matmul(rnn_out, softmax_weight)
     projection = layers.elementwise_add(projection, softmax_bias)
     projection = layers.reshape(
-        projection, shape=[-1, vocab_size], inplace=True)
+        projection, shape=[-1, vocab_size])  #, inplace=True)
 
     loss = layers.softmax_with_cross_entropy(
         logits=projection, label=y, soft_label=False)
